@@ -127,6 +127,11 @@
   .note{ font-size:12px; color:#9aa3ad; font-style:italic; margin-top:8px; }
   .helper-row{ margin-top:10px; font-size:13px; }
 
+  .analysis-box{ background:#eef7f0; border:1px solid #bfe3c6; border-radius:10px; padding:14px 16px; margin-top:4px; margin-bottom:4px; }
+  .analysis-title{ font-weight:800; color:#1a7f37; font-size:13px; margin-bottom:6px; }
+  .analysis-detail{ font-size:12.5px; color:var(--ink); margin-top:4px; line-height:1.5; }
+  .analysis-detail strong{ color:var(--navy); }
+
   .proposal-frame{ border:1px solid var(--line); border-radius:12px; overflow:hidden; }
   .img-stage{ position:relative; line-height:0; }
   .img-stage img{ width:100%; display:block; }
@@ -390,6 +395,7 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.18.5/package/dist/xlsx.full.min.js"></script>
 <script>
 // ===== Icon library (outline, uniform stroke/color everywhere it's used) =====
 const ICONS = {
@@ -415,6 +421,7 @@ const ICON_COLOR = "#1F4E79"; // uniform outline color for every category icon o
 // (set once, below the proposal image in Step 3) rather than a per-category
 // choice — so all four layouts always match.
 const BRAND_DEFAULT = { primary: "#1F4E79", accent: "#D9782D", font: "Arial, Helvetica, sans-serif" };
+const brand = { primary: BRAND_DEFAULT.primary, accent: BRAND_DEFAULT.accent, font: BRAND_DEFAULT.font };
 function defaultLayout(name) {
   return {
     header: { enabled: true, name: name },
@@ -425,14 +432,14 @@ function defaultLayout(name) {
       { label: "Resources & Tools", caption: "Templates, guides, and materials." }],
     sectionRatios: [],
     footer: { enabled: true, label: "Hub Apps", apps: [{ label: "Salesforce" }, { label: "Workday" }] },
-    primary: BRAND_DEFAULT.primary,
-    accent: BRAND_DEFAULT.accent,
-    font: BRAND_DEFAULT.font,
+    primary: brand.primary,
+    accent: brand.accent,
+    font: brand.font,
   };
 }
 const state = {
   triage: null,
-  brand: { primary: BRAND_DEFAULT.primary, accent: BRAND_DEFAULT.accent, font: BRAND_DEFAULT.font },
+  analysis: null, // set once an uploaded document export has been analyzed
   categories: [
     { name: "Franchise Operations", layout: defaultLayout("Franchise Operations") },
     { name: "Training & Onboarding", layout: defaultLayout("Training & Onboarding") },
@@ -487,9 +494,10 @@ function renderStep2() {
     branch.innerHTML = `
       <div class="upload-box" onclick="document.getElementById('fileInputUploaded').click()">
         Click to upload the Helpdesk audit report (CSV or Excel)
-        <input type="file" id="fileInputUploaded" accept=".csv,.xlsx,.xls" onchange="onFileChosen(this,'uploadedFileNote')">
+        <input type="file" id="fileInputUploaded" accept=".csv,.xlsx,.xls" onchange="onHubFileChosen(this,'uploadedFileNote')">
       </div>
       <div class="file-chosen" id="uploadedFileNote"></div>
+      <div class="analysis-box" id="uploadedAnalysisBox" style="display:none;"></div>
       <div class="helper-row">Don't have the document yet?
         <button class="btn link" onclick="openEmailModal()">Request it from Helpdesk</button>
       </div>`;
@@ -519,6 +527,183 @@ function renderStep2() {
 function onFileChosen(input, noteId) {
   const note = document.getElementById(noteId);
   if (input.files && input.files[0]) note.textContent = "Selected: " + input.files[0].name;
+}
+
+// ===== Document-export analysis (Helpdesk audit CSV/Excel) =====
+// Parses the uploaded document-library export, then suggests real Hub
+// categories from the actual content: quick links = the most-downloaded
+// documents, sections = the largest real folder groupings, and the overall
+// category split favors one consolidated "Franchise Hub Resources" bucket
+// unless a distinct, sizeable cluster (marketing, help/support, training,
+// policy) clearly justifies splitting it out — up to 4 categories total,
+// matching the hub-document-audit skill's own methodology.
+function detectHubSchema(headers) {
+  const h = headers.map(x => String(x || "").toLowerCase().trim());
+  if (h.includes("document_path")) return "path";
+  if (h.some(x => x.includes("document url"))) return "report";
+  return "unknown";
+}
+function pathParts(p, n) {
+  if (!p) return "";
+  const parts = String(p).split("->").map(s => s.trim()).filter(Boolean);
+  return parts[n - 1] || "";
+}
+function hubToNumber(v) {
+  if (v === null || v === undefined || v === "") return 0;
+  const n = parseFloat(String(v).replace(/,/g, ""));
+  return isNaN(n) ? 0 : n;
+}
+function normalizeHubRows(rows, schema) {
+  return rows.map(r => {
+    const title = r.document_title ?? r["Document Title"] ?? r.title ?? "Untitled document";
+    const path = r.document_path ?? r["Document URL"] ?? "";
+    let topCategory, subcategory;
+    if (schema === "path") {
+      // "Intranet -> Library -> <Top Category> -> <Subcategory> -> ... -> <file>"
+      topCategory = pathParts(path, 3);
+      subcategory = pathParts(path, 4);
+    }
+    topCategory = topCategory || r.document_type_label || r["Document Type"] || "General";
+    subcategory = subcategory || r.document_subtype || r["Document Subtype"] || "";
+    const downloadCount = hubToNumber(r.download_count ?? r["Download Count"] ?? 0);
+    return {
+      title: String(title).trim() || "Untitled document",
+      topCategory: String(topCategory).trim() || "General",
+      subcategory: String(subcategory).trim(),
+      downloadCount,
+    };
+  });
+}
+// Short, clickable quick-link label from a raw document title/filename.
+function titleToLabel(title) {
+  let t = String(title || "").replace(/\.(pdf|docx?|xlsx?|pptx?|csv)$/i, "");
+  t = t.replace(/[_\-]+/g, " ").replace(/\s+/g, " ").trim();
+  if (t.length > 34) {
+    const words = t.split(" ");
+    let out = "";
+    for (const w of words) {
+      if ((out + " " + w).trim().length > 34) break;
+      out = (out + " " + w).trim();
+    }
+    t = out || t.slice(0, 34);
+  }
+  return t;
+}
+// Keyword rules for the categories worth splitting out of the main bucket —
+// matched against the export's own real folder/category names.
+const SECONDARY_CATEGORY_RULES = [
+  { test: /market|brand|social|campaign|advertis/i, name: "Marketing Resources" },
+  { test: /help|support|faq|contact|ticket|service.?desk/i, name: "Help Center" },
+  { test: /train|onboard|certif|learn|academy/i, name: "Training & Onboarding" },
+  { test: /polic|complian|legal|safety|audit|standard/i, name: "Policies & Compliance" },
+];
+function buildCategoryFromDocs(name, docs) {
+  const sorted = [...docs].sort((a, b) => b.downloadCount - a.downloadCount);
+  const seen = new Set();
+  const quickLinks = [];
+  for (const d of sorted) {
+    const label = titleToLabel(d.title);
+    const key = label.toLowerCase();
+    if (!label || seen.has(key)) continue;
+    seen.add(key);
+    quickLinks.push({ label, caption: d.downloadCount ? `${d.downloadCount} downloads` : "" });
+    if (quickLinks.length >= 4) break;
+  }
+  const bySub = {};
+  docs.forEach(d => {
+    const key = d.subcategory || "";
+    if (!key) return;
+    bySub[key] = (bySub[key] || 0) + 1;
+  });
+  const subEntries = Object.entries(bySub).sort((a, b) => b[1] - a[1]);
+  let sections = subEntries.slice(0, 4).map(([label, count]) => ({
+    label, caption: `${count} document${count === 1 ? "" : "s"}`,
+  }));
+  if (!sections.length) {
+    sections = [{ label: "Overview", caption: `${docs.length} document${docs.length === 1 ? "" : "s"}` }];
+  }
+  const L = defaultLayout(name);
+  L.header.name = name;
+  L.quickLinks = quickLinks.length ? quickLinks : L.quickLinks;
+  L.sections = sections;
+  L.sectionRatios = [];
+  return { name, layout: L };
+}
+function analyzeHubExport(records) {
+  const totalDocs = records.length;
+  const byCat = {};
+  records.forEach(r => {
+    const key = r.topCategory || "General";
+    if (!byCat[key]) byCat[key] = [];
+    byCat[key].push(r);
+  });
+  const cats = Object.entries(byCat).map(([name, docs]) => ({
+    name, docs,
+    count: docs.length,
+    totalDownloads: docs.reduce((s, d) => s + d.downloadCount, 0),
+  }));
+  cats.sort((a, b) => (b.totalDownloads + b.count * 2) - (a.totalDownloads + a.count * 2));
+
+  const secondary = [];
+  const mainDocs = [];
+  cats.forEach(c => {
+    const share = totalDocs ? c.count / totalDocs : 0;
+    const rule = SECONDARY_CATEGORY_RULES.find(r => r.test.test(c.name));
+    if (rule && share >= 0.12 && secondary.length < 3 && !secondary.some(s => s.name === rule.name)) {
+      secondary.push({ name: rule.name, docs: c.docs });
+    } else {
+      mainDocs.push(...c.docs);
+    }
+  });
+
+  const buckets = [];
+  if (mainDocs.length) buckets.push({ name: "Franchise Hub Resources", docs: mainDocs });
+  secondary.forEach(s => buckets.push(s));
+  while (buckets.length > 4) {
+    const extra = buckets.pop();
+    buckets[0].docs.push(...extra.docs);
+  }
+  if (!buckets.length) buckets.push({ name: "Franchise Hub Resources", docs: records });
+
+  const categories = buckets.map(b => buildCategoryFromDocs(b.name, b.docs));
+  return {
+    totalDocs,
+    folderCount: cats.length,
+    categories,
+    buckets: buckets.map(b => ({ name: b.name, count: b.docs.length })),
+  };
+}
+async function onHubFileChosen(input, noteId) {
+  const note = document.getElementById(noteId);
+  const box = document.getElementById("uploadedAnalysisBox");
+  if (!input.files || !input.files[0]) return;
+  const file = input.files[0];
+  note.textContent = "Selected: " + file.name;
+  if (box) { box.style.display = "block"; box.innerHTML = "Analyzing document export…"; }
+  try {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: "array", cellDates: true });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+    if (!rows.length) throw new Error("The file has no rows to analyze.");
+    const schema = detectHubSchema(Object.keys(rows[0]));
+    const records = normalizeHubRows(rows, schema);
+    const analysis = analyzeHubExport(records);
+    state.analysis = analysis;
+    state.categories = analysis.categories.slice(0, 4);
+    renderCatListEditor();
+    renderHotspots();
+    if (box) {
+      box.innerHTML =
+        `<div class="analysis-title">Analyzed ${analysis.totalDocs} documents across ${analysis.folderCount} folder${analysis.folderCount === 1 ? "" : "s"}.</div>` +
+        `<div class="analysis-detail">Suggested categories: ${analysis.buckets.map(b => `<strong>${escapeHtml(b.name)}</strong> (${b.count} doc${b.count === 1 ? "" : "s"})`).join(" · ")}.</div>` +
+        `<div class="analysis-detail">Quick links were built from the most-downloaded documents in each group, and sections from the largest real folders — review and adjust them in Step 3.</div>`;
+    }
+  } catch (err) {
+    if (box) {
+      box.innerHTML = `<div class="analysis-detail" style="color:#c0392b;">Couldn't analyze this file (${escapeHtml(err.message)}). The default categories below are still available to edit in Step 3.</div>`;
+    }
+  }
 }
 
 // ===== Modals =====
@@ -828,31 +1013,31 @@ function setSectionRatio(pairIdx, val) {
 }
 // ===== Brand colors & font: one shared setup applied to every category =====
 function renderBrandControls() {
-  document.getElementById("brandPrimaryColor").value = state.brand.primary;
-  document.getElementById("brandAccentColor").value = state.brand.accent;
-  document.getElementById("brandFontSelect").value = state.brand.font;
+  document.getElementById("brandPrimaryColor").value = brand.primary;
+  document.getElementById("brandAccentColor").value = brand.accent;
+  document.getElementById("brandFontSelect").value = brand.font;
 }
 function applyBrandToAllCategories() {
   state.categories.forEach(c => {
-    c.layout.primary = state.brand.primary;
-    c.layout.accent = state.brand.accent;
-    c.layout.font = state.brand.font;
+    c.layout.primary = brand.primary;
+    c.layout.accent = brand.accent;
+    c.layout.font = brand.font;
   });
   if (currentLayoutIndex !== null) updateLayoutPreview();
 }
 function onBrandColorChange() {
-  state.brand.primary = document.getElementById("brandPrimaryColor").value;
-  state.brand.accent = document.getElementById("brandAccentColor").value;
+  brand.primary = document.getElementById("brandPrimaryColor").value;
+  brand.accent = document.getElementById("brandAccentColor").value;
   applyBrandToAllCategories();
 }
 function onBrandFontChange() {
-  state.brand.font = document.getElementById("brandFontSelect").value;
+  brand.font = document.getElementById("brandFontSelect").value;
   applyBrandToAllCategories();
 }
 function onBrandFontName() {
   const typed = document.getElementById("brandFontNameInput").value.trim();
   if (typed) {
-    state.brand.font = typed + ", Arial, Helvetica, sans-serif";
+    brand.font = typed + ", Arial, Helvetica, sans-serif";
     applyBrandToAllCategories();
   }
 }
